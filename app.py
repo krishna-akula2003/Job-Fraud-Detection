@@ -154,179 +154,331 @@
 #     initialize_db()
 #     main()
 
+import streamlit as st
+import pandas as pd
+import joblib
+import sqlite3
+import re
+import string
+import unicodedata
+import pymupdf  # PyMuPDF for PDF processing
+from docx import Document  # python-docx for Word processing
+import os
+import numpy as np
+import time
+import random
+import webbrowser
 
+st.set_page_config(page_title="Job Authenticity Checker", layout="wide")
 
+# Paths
+BASE_DIR = r"C:\xampp_inuse\htdocs\web\formvalidation\prediction"
+MODEL_PATH = os.path.join(BASE_DIR, "logistic_newdataset (2).pkl")
+VECTORIZER_PATH = os.path.join(BASE_DIR, "tfidf_vectorizer_newdataset.pkl")
+DB_PATH = os.path.join(BASE_DIR, "job_postings.db")
 
-# import streamlit as st
-# import pandas as pd
-# import joblib
-# import sqlite3
-# import re
-# import string
-# import unicodedata
-# import pymupdf  # PyMuPDF for PDF processing
-# from docx import Document  # python-docx for Word processing
-# import os
+# Initialize database
+def initialize_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS postings 
+                        (id INTEGER PRIMARY KEY, 
+                        job_title TEXT, 
+                        description TEXT, 
+                        prediction INTEGER)''')
 
-# # ✅ Database & Model Paths
-# DB_PATH = "job_postings.db"
-# MODEL_PATH = "formvalidation/prediction/logistic_randomforest.pkl"
-# VECTORIZER_PATH = "formvalidation/prediction/tfidf_vectorizer.pkl"
+# Fetch stored jobs
+def fetch_stored_jobs():
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query('SELECT job_title, description, prediction FROM postings', conn)
+    if not df.empty:
+        df = df.applymap(lambda x: unicodedata.normalize("NFKD", x).encode('utf-8', 'ignore').decode() if isinstance(x, str) else x)
+    return df
 
-# # ✅ Initialize database
-# def initialize_db():
-#     with sqlite3.connect(DB_PATH) as conn:
-#         conn.execute('''CREATE TABLE IF NOT EXISTS postings 
-#                         (id INTEGER PRIMARY KEY, 
-#                         job_title TEXT, 
-#                         description TEXT, 
-#                         prediction INTEGER)''')
+# Store job prediction
+def store_to_db(job_title, description, prediction):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('INSERT INTO postings (job_title, description, prediction) VALUES (?, ?, ?)', 
+                     (job_title.encode('utf-8', 'ignore').decode(), 
+                      description.encode('utf-8', 'ignore').decode(), 
+                      prediction))
 
-# # ✅ Fetch stored jobs from the database
-# def fetch_stored_jobs():
-#     with sqlite3.connect(DB_PATH) as conn:
-#         df = pd.read_sql_query('SELECT job_title, description, prediction FROM postings', conn)
-    
-#     if not df.empty:
-#         df = df.applymap(lambda x: unicodedata.normalize("NFKD", x).encode('utf-8', 'ignore').decode() if isinstance(x, str) else x)
-    
-#     return df
+# Preprocessing function
+def preprocess_text(text):
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
-# # ✅ Store new job predictions in database
-# def store_to_db(job_title, description, prediction):
-#     with sqlite3.connect(DB_PATH) as conn:
-#         conn.execute('INSERT INTO postings (job_title, description, prediction) VALUES (?, ?, ?)', 
-#                      (job_title.encode('utf-8', 'ignore').decode(), 
-#                       description.encode('utf-8', 'ignore').decode(), 
-#                       prediction))
+# Scam keyword detection function
+SCAM_KEYWORDS = [
+    "work from home", "no experience", "click here", "signup bonus", "quick money", "limited time",
+    "urgent requirement", "get paid", "make money", "easy income", "bitcoin", "investment opportunity",
+    "sms sending job", "form filling", "weekly payout", "earn instantly", "part time work without investment",
+    "zero investment", "job guarantee", "work today get paid today", "data entry scam", "easy registration",
+    "just 2 hours a day"
+]
 
-# # ✅ Preprocessing function to clean text
-# def preprocess_text(text):
-#     text = text.lower()
-#     text = unicodedata.normalize("NFKD", text)  # Normalize unicode
-#     text = re.sub(r'[^\x00-\x7F]+', ' ', text)  # Remove non-ASCII characters
-#     text = text.translate(str.maketrans('', '', string.punctuation))  # Remove punctuation
-#     text = re.sub(r'\s+', ' ', text).strip()  # Remove extra spaces
-#     return text
+def contains_scam_keywords(text):
+    text = text.lower()
+    # Check for any keyword presence using regex for robustness
+    for keyword in SCAM_KEYWORDS:
+        # Use word boundaries to ensure exact matches
+        if re.search(r'\b' + re.escape(keyword) + r'\b', text):
+            return True
+    return False
 
-# # ✅ Extract text from PDF files
-# def extract_text_from_pdf(file):
-#     doc = pymupdf.open(stream=file.read(), filetype="pdf")
-#     return "\n".join([page.get_text("text") for page in doc])
+# File handlers
+def extract_text_from_pdf(file):
+    doc = pymupdf.open(stream=file.read(), filetype="pdf")
+    return "\n".join([page.get_text("text") for page in doc])
 
-# # ✅ Extract text from Word (DOCX) files
-# def extract_text_from_docx(file):
-#     doc = Document(file)
-#     return "\n".join([para.text for para in doc.paragraphs])
+def extract_text_from_docx(file):
+    doc = Document(file)
+    return "\n".join([para.text for para in doc.paragraphs])
 
-# # ✅ Load the trained model & TF-IDF vectorizer
-# if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
-#     model = joblib.load(MODEL_PATH)
-#     tfidf_vectorizer = joblib.load(VECTORIZER_PATH)  # Load the vectorizer
-# else:
-#     st.error("Model or vectorizer file not found! Ensure 'logistic_randomforest.pkl' and 'tfidf_vectorizer.pkl' exist.")
-#     st.stop()
+# Cached model and vectorizer loading
+@st.cache_resource
+def load_model_and_vectorizer():
+    if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
+        model = joblib.load(MODEL_PATH)
+        vectorizer = joblib.load(VECTORIZER_PATH)
+        return model, vectorizer
+    else:
+        st.error("Model or vectorizer file not found!")
+        st.stop()
 
-# # ✅ Prediction function (Fixed ValueError)
-# def predict_job_real_or_fake(description):
-#     preprocessed_text = preprocess_text(description)  # Clean text
-#     transformed_text = tfidf_vectorizer.transform([preprocessed_text])  # Convert to TF-IDF
-#     return model.predict(transformed_text)[0]  # Predict using trained model
+model, tfidf_vectorizer = load_model_and_vectorizer()
 
-# # ✅ Streamlit UI
-# def main():
-#     st.set_page_config(page_title="Job Authenticity Checker", layout="wide")
-#     st.markdown(
-#         """
-#         <style>
-#             .main-title {
-#                 font-size: 32px;
-#                 font-weight: bold;
-#                 text-align: center;
-#                 color: #FFD700;
-#             }
-#             .sidebar .sidebar-content {
-#                 background: linear-gradient(to bottom, #1e1e2e, #282a36);
-#             }
-#             .stButton>button {
-#                 background: #4CAF50;
-#                 color: white;
-#                 font-size: 18px;
-#                 border-radius: 8px;
-#                 padding: 10px;
-#                 width: 100%;
-#             }
-#             .stTextInput, .stTextArea {
-#                 border-radius: 8px;
-#                 border: 1px solid #ccc;
-#             }
-#             .prediction-box {
-#                 text-align: center;
-#                 font-size: 20px;
-#                 font-weight: bold;
-#                 padding: 15px;
-#                 border-radius: 8px;
-#             }
-#         </style>
-#         """,
-#         unsafe_allow_html=True,
-#     )
+# Predict function
+def predict_job_real_or_fake(description):
+    preprocessed_text = preprocess_text(description)
+    transformed_text = tfidf_vectorizer.transform([preprocessed_text])
+    return model.predict(transformed_text)[0]
 
-#     st.markdown('<p class="main-title">🔍 Job Posting Authenticity Checker</p>', unsafe_allow_html=True)
-#     st.sidebar.title("Navigation")
-    
-#     menu = ["Home", "Stored Jobs", "About"]
-#     choice = st.sidebar.radio("Go to", menu)
-    
-#     if choice == "Home":
-#         st.subheader("Upload Job Details")
-#         uploaded_file = st.file_uploader("Upload job description (PDF/DOCX)", type=["pdf", "docx"], key="file_uploader")
-#         job_title, description = "", ""
-        
-#         if uploaded_file:
-#             file_type = uploaded_file.type
-#             if "pdf" in file_type:
-#                 file_content = extract_text_from_pdf(uploaded_file)
-#             elif "word" in file_type or "msword" in file_type:
-#                 file_content = extract_text_from_docx(uploaded_file)
+# Search web for company links
+def get_company_links(company_name):
+    search_url = f"https://www.google.com/search?q={company_name.replace(' ', '+')}+company+official"
+    return search_url
 
-#             file_lines = file_content.split("\n", 1)
-#             if len(file_lines) >= 2:
-#                 job_title, description = file_lines[0], file_lines[1]
-#             else:
-#                 st.warning("Invalid file format. Ensure the first line is the job title.")
-#                 return
-#         else:
-#             job_title = st.text_input("Job Title")
-#             description = st.text_area("Job Description", height=200)
-        
-#         if st.button("Predict", use_container_width=True):
-#             if job_title and description:
-#                 prediction = predict_job_real_or_fake(description)
-#                 result_text = "✅ Job Posting is Real" if prediction == 0 else "❌ Likely Fake"
-#                 color = "#4CAF50" if prediction == 0 else "#FF5733"
-#                 st.markdown(f'<p class="prediction-box" style="background-color:{color}; color:white;">{result_text}</p>', unsafe_allow_html=True)
-#                 store_to_db(job_title, description, prediction)
-#             else:
-#                 st.warning("Please enter a job title and description.")
-    
-#     elif choice == "Stored Jobs":
-#         st.subheader("Stored Job Postings")
-#         df = fetch_stored_jobs()
-#         if not df.empty:
-#             st.dataframe(df, use_container_width=True)
-#         else:
-#             st.warning("No job postings stored yet.")
-    
-#     elif choice == "About":
-#         st.subheader("About This App")
-#         st.info("This app helps in detecting fake job postings using machine learning models.")
+# Streamlit UI
+def main():
+    # Initialize session state
+    if "show_loader" not in st.session_state:
+        st.session_state.show_loader = False
+    if "prediction_done" not in st.session_state:
+        st.session_state.prediction_done = False
+    if "job_title" not in st.session_state:
+        st.session_state.job_title = ""
+    if "description" not in st.session_state:
+        st.session_state.description = ""
+    if "result_text" not in st.session_state:
+        st.session_state.result_text = ""
+    if "prediction" not in st.session_state:
+        st.session_state.prediction = None
 
-# if __name__ == "__main__":
-#     initialize_db()
-#     main()
+    # CSS styling
+    st.markdown("""<style>
+        .stApp {
+            background: linear-gradient(135deg, #FFE1E1 0%, #E1F5FF 100%);
+            font-family: 'Poppins', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        .main-title {
+            font-size: 100px;
+            font-weight: 700;
+            text-align: center;
+            text-transform: uppercase;
+            letter-spacing: 5px;
+            display: inline-block;
+            background: linear-gradient(90deg, #FF6F61 25%, #FFCA28 50%, #FF6F61 75%);
+            background-size: 200% 100%;
+            animation: shine 1s ease-in-out infinite;
+            -webkit-background-clip: text;
+            color: transparent;
+        }
+        @keyframes shine {
+            0% { background-position: -100%; }
+            100% { background-position: 100%; }
+        }
+        .prediction-box {
+            background-color: #FFFFFF;
+            color: #333;
+            text-align: center;
+            font-size: 22px;
+            font-weight: 600;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+            margin-top: 20px;
+            transition: transform 0.3s ease;
+            animation: slideIn 1s ease-out;
+        }
+        @keyframes slideIn {
+            0% { transform: translateY(30px); opacity: 0; }
+            100% { transform: translateY(0); opacity: 1; }
+        }
+        .fullscreen-loader {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            background: rgba(255, 255, 255, 0.9) !important;
+            z-index: 9999 !important;
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+        }
+        .loader {
+            width: 80px !important;
+            aspect-ratio: 1 !important;
+            border: 15px solid #ddd !important;
+            border-radius: 50% !important;
+            position: relative !important;
+            transform: rotate(45deg) !important;
+        }
+        .loader::before {
+            content: "" !important;
+            position: absolute !important;
+            inset: -15px !important;
+            border-radius: 50% !important;
+            border: 15px solid #514b82 !important;
+            animation: l18 2s infinite linear !important;
+        }
+        @keyframes l18 {
+            0% {clip-path:polygon(50% 50%,0 0,0 0,0 0,0 0,0 0)}
+            25% {clip-path:polygon(50% 50%,0 0,100% 0,100% 0,100% 0,100% 0)}
+            50% {clip-path:polygon(50% 50%,0 0,100% 0,100% 100%,100% 100%,100% 100%)}
+            75% {clip-path:polygon(50% 50%,0 0,100% 0,100% 100%,0 100%,0 100%)}
+            100% {clip-path:polygon(50% 50%,0 0,100% 0,100% 100%,0 100%,0 0)}
+        }
+    </style>""", unsafe_allow_html=True)
 
+    # Create a placeholder for the loader
+    loader_placeholder = st.empty()
 
+    # Show loader in the placeholder if active
+    if st.session_state.show_loader:
+        with loader_placeholder.container():
+            st.markdown('<div class="fullscreen-loader"><div class="loader"></div></div>', unsafe_allow_html=True)
+            st.markdown('<p style="text-align: center; font-size: 20px; color: #514b82;">Analyzing job description...</p>', unsafe_allow_html=True)
+            st.write("DEBUG: Loader is active")
+
+    st.markdown('<p class="main-title">Job Posting Authenticity Checker</p>', unsafe_allow_html=True)
+
+    st.sidebar.title("Navigation")
+    menu = ["Home", "Stored Jobs", "About"]
+    choice = st.sidebar.radio("Go to", menu)
+
+    if choice == "Home":
+        st.subheader("Upload Job Details")
+
+        # Input fields
+        uploaded_file = st.file_uploader("Upload job description (PDF/DOCX)", type=["pdf", "docx"])
+        job_title, description = "", ""
+
+        if uploaded_file:
+            file_type = uploaded_file.type
+            if "pdf" in file_type:
+                file_content = extract_text_from_pdf(uploaded_file)
+            elif "word" in file_type or "msword" in file_type:
+                file_content = extract_text_from_docx(uploaded_file)
+
+            file_lines = file_content.split("\n", 1)
+            if len(file_lines) >= 2:
+                job_title, description = file_lines[0], file_lines[1]
+            else:
+                st.warning("Invalid file format. Ensure the first line is the job title.")
+                return
+        else:
+            job_title = st.text_input("Job Title", value=st.session_state.job_title)
+            description = st.text_area("Job Description", value=st.session_state.description, height=200)
+
+        if st.button("Predict", use_container_width=True):
+            if job_title and description:
+                if len(description.split()) < 30:
+                    st.warning("Please enter a job description of at least 30 words.")
+                else:
+                    st.session_state.job_title = job_title
+                    st.session_state.description = description
+                    st.session_state.show_loader = True
+                    st.session_state.prediction_done = False
+                    st.session_state.result_text = ""
+                    st.session_state.prediction = None
+                    # Process prediction
+                    with loader_placeholder.container():
+                        st.markdown('<div class="fullscreen-loader"><div class="loader"></div></div>', unsafe_allow_html=True)
+                        st.markdown('<p style="text-align: center; font-size: 20px; color: #514b82;">Analyzing job description...</p>', unsafe_allow_html=True)
+                        time.sleep(random.randint(6, 8))  # Simulate processing time
+                    # Check for scam keywords first
+                    if contains_scam_keywords(description):
+                        prediction = 1
+                        result_text = "This job posting is likely fraudulent."
+                        color = "#FF5733"
+                        debug_message = "DEBUG: Prediction based on scam keywords detected."
+                    else:
+                        prediction = predict_job_real_or_fake(description)
+                        result_text = "This job posting appears to be authentic." if prediction == 0 else "This job posting is likely fraudulent."
+                        color = "#4CAF50" if prediction == 0 else "#FF5733"
+                        debug_message = "DEBUG: Prediction based on pickle model."
+
+                    st.session_state.result_text = result_text
+                    st.session_state.prediction = prediction
+                    st.session_state.show_loader = False
+                    st.session_state.prediction_done = True
+                    store_to_db(job_title, description, prediction)
+                    loader_placeholder.empty()  # Clear the loader
+                    st.write(debug_message)  # Show which prediction method was used
+                    st.rerun()  # Force rerun to update UI
+            else:
+                st.warning("Please enter a job title and description.")
+
+        # Display prediction if done
+        if st.session_state.prediction_done:
+            st.markdown(
+                f'<p class="prediction-box" style="background-color:{("#4CAF50" if st.session_state.prediction == 0 else "#FF5733")}; color:white;">{st.session_state.result_text}</p>',
+                unsafe_allow_html=True
+            )
+
+            if not contains_scam_keywords(st.session_state.description):
+                stack_trace = [
+                    "Input received and preprocessed.",
+                    "Text transformed using TF-IDF Vectorizer.",
+                    "Transformed input passed to Logistic Regression model.",
+                    f"Model prediction: {st.session_state.prediction} → Classified as {'REAL' if st.session_state.prediction == 0 else 'FAKE'} job."
+                ]
+                explanation_html = "<div class='prediction-box' style='background-color:#ffffff; color:#333333; font-size:18px; margin-top:10px;'>"
+                explanation_html += "<b>Stack Trace Explanation:</b><ul style='margin-top: 10px;'>"
+                for step in stack_trace:
+                    explanation_html += f"<li>{step}</li>"
+                explanation_html += "</ul></div>"
+                st.markdown(explanation_html, unsafe_allow_html=True)
+
+            st.sidebar.subheader("🔗 Related Company Info")
+            company_search_url = get_company_links(st.session_state.job_title)
+            st.sidebar.markdown(f"[Search about {st.session_state.job_title}]({company_search_url})")
+
+    elif choice == "Stored Jobs":
+        st.subheader("Stored Job Postings")
+        df = fetch_stored_jobs()
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.warning("No job postings have been stored yet.")
+
+    elif choice == "About":
+        st.subheader("About This App")
+        st.info("This application assists in detecting fraudulent job postings using a combination of machine learning predictions and keyword-based analysis.")
+
+if __name__ == "__main__":
+    initialize_db()
+    main()
 
 # import re
 # import string
@@ -417,325 +569,189 @@
 #     initialize_db()
 #     main()
 
-import streamlit as st
-import time
-import random
 
-# Set page configuration
-st.set_page_config(page_title="Job Authenticity Checker", layout="wide")
 
-# Custom CSS for a modern, colorful, and professional design with enhanced animations
-st.markdown("""
-    <style>
-        /* App-wide styling */
-        .stApp {
-            background: linear-gradient(135deg, #FFE1E1 0%, #E1F5FF 100%); /* Gradient from soft pink to light blue */
-            font-family: 'Roboto', sans-serif;
-            padding: 20px;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
 
-        /* Title and subtitle */
-        h1 {
-            color: #D81B60; /* Vibrant Pink for title */
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            animation: fadeIn 1s ease-in-out;
-        }
-        p {
-            text-align: center;
-        }
+# /////////////////////////////////////////////////////////////////////////
+# import streamlit as st
+# import time
+# import pandas as pd
+# import random
+# import joblib
+# import os
+# import sqlite3
+# import unicodedata
+# import re
+# import string
+# import docx
+# import fitz  # PyMuPDF
 
-        /* Animations */
-        @keyframes fadeIn {
-            0% { opacity: 0; }
-            100% { opacity: 1; }
-        }
+# # --- Load Model & Vectorizer ---
+# import joblib
 
-        @keyframes slideInLeft {
-            0% { transform: translateX(-30px); opacity: 0; }
-            100% { transform: translateX(0); opacity: 1; }
-        }
+# DB_PATH = "job_postings.db"
+# MODEL_PATH = "formvalidation/prediction/logistic_randomforest.pkl"
+# VECTORIZER_PATH = "formvalidation/prediction/tfidf_vectorizer.pkl"
 
-        @keyframes slideInRight {
-            0% { transform: translateX(30px); opacity: 0; }
-            100% { transform: translateX(0); opacity: 1; }
-        }
+# # Load the model
+# try:
+#     model = joblib.load(MODEL_PATH)
+#     print("Model loaded successfully!")
+# except Exception as e:
+#     print("Error loading model:", e)
 
-        @keyframes pulse {
-            0% { transform: scale(1); }
-            50% { transform: scale(1.05); }
-            100% { transform: scale(1); }
-        }
+# # Load the TF-IDF vectorizer
+# try:
+#     tfidf_vectorizer = joblib.load(VECTORIZER_PATH)
+#     print("Vectorizer loaded successfully!")
+# except Exception as e:
+#     print("Error loading vectorizer:", e)
 
-        @keyframes fadeText {
-            0% { opacity: 0.3; }
-            50% { opacity: 1; }
-            100% { opacity: 0.3; }
-        }
 
-        @keyframes bounce {
-            0% { transform: translateY(0); }
-            50% { transform: translateY(-20px); }
-            100% { transform: translateY(0); }
-        }
+# # --- Styling ---
+# st.set_page_config(page_title="Job Authenticity Checker", layout="wide")
 
-        @keyframes waveBar {
-            0% { transform: scaleY(1); background-color: #FF6F61; }
-            25% { transform: scaleY(2); background-color: #FFCA28; }
-            50% { transform: scaleY(1); background-color: #AB47BC; }
-            75% { transform: scaleY(1.5); background-color: #0288D1; }
-            100% { transform: scaleY(1); background-color: #FF6F61; }
-        }
+# st.markdown("""
+#     <style>
+#     body { background-color: #F9F9F9; font-family: 'Segoe UI', sans-serif; }
+#     .main-title { font-size: 3em; font-weight: bold; color: #4A4A4A; margin-bottom: 10px; text-align: center; }
+#     .subtitle { font-size: 1.2em; color: #6C757D; text-align: center; margin-bottom: 30px; }
+#     .upload-box { background-color: #FFFFFF; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); margin-bottom: 20px; }
+#     .analyze-button button { background-color: #4CAF50; color: white; font-weight: bold; border-radius: 10px; padding: 0.75em 2em; }
+#     .result-container { background-color: #FFFFFF; padding: 30px; border-radius: 15px; box-shadow: 0 8px 24px rgba(0,0,0,0.15); margin-top: 30px; }
+#     .highlight-file { font-size: 0.95em; color: #555; margin-top: 10px; font-style: italic; }
+#     .loading-box { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 30px; background-color: #f0f8ff; border-radius: 15px; margin-top: 20px; }
+#     .fade-text { margin-top: 15px; font-size: 1.2em; color: #007BFF; animation: fadeIn 2s infinite alternate; }
+#     .wave-container { display: flex; justify-content: center; gap: 8px; margin-top: 15px; }
+#     .wave-bar { width: 10px; height: 20px; background: #4CAF50; border-radius: 5px; animation: wave 1.2s infinite ease-in-out; }
+#     .wave-bar:nth-child(2) { animation-delay: -1.1s; }
+#     .wave-bar:nth-child(3) { animation-delay: -1.0s; }
+#     .wave-bar:nth-child(4) { animation-delay: -0.9s; }
+#     .wave-bar:nth-child(5) { animation-delay: -0.8s; }
+#     .ball { width: 12px; height: 12px; background-color: #007BFF; border-radius: 50%; margin-top: 10px; animation: bounce 1s infinite; }
+#     .ball:nth-child(2) { animation-delay: 0.2s; }
+#     .ball:nth-child(3) { animation-delay: 0.4s; }
 
-        @keyframes loadingGradient {
-            0% { background: rgba(40, 53, 147, 0.9); }
-            50% { background: rgba(74, 20, 140, 0.9); }
-            100% { background: rgba(40, 53, 147, 0.9); }
-        }
+#     @keyframes wave {
+#         0%, 100% { transform: scaleY(1); }
+#         50% { transform: scaleY(2); }
+#     }
+#     @keyframes bounce {
+#         0%, 100% { transform: translateY(0); }
+#         50% { transform: translateY(-10px); }
+#     }
+#     @keyframes fadeIn {
+#         0% { opacity: 0.4; }
+#         100% { opacity: 1; }
+#     }
+#     </style>
+# """, unsafe_allow_html=True)
 
-        /* Card Styling for Sections */
-        .card {
-            background-color: #FFFFFF;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
-            margin-bottom: 20px;
-            transition: transform 0.3s ease;
-            border: 2px solid #FFAB91; /* Soft coral border for cards */
-        }
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.15);
-            border-color: #FF6F61; /* Darker coral on hover */
-        }
-        .card-left {
-            animation: slideInLeft 0.8s ease-out;
-        }
-        .card-right {
-            animation: slideInRight 0.8s ease-out;
-        }
+# st.markdown('<div class="main-title">🕵️‍♂️ Job Authenticity Checker</div>', unsafe_allow_html=True)
+# st.markdown('<div class="subtitle">Paste a job description or upload a file.</div>', unsafe_allow_html=True)
 
-        /* Section Headers */
-        h3 {
-            color: #0288D1; /* Bright blue for section headers */
-            font-weight: 700;
-            margin-bottom: 15px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-size: 18px;
-        }
+# # --- Input Fields ---
+# st.markdown('<div class="upload-box">', unsafe_allow_html=True)
+# job_title = st.text_input("Job Title")
+# job_description = st.text_area("Paste Job Description Here", height=200)
+# uploaded_file = st.file_uploader("Or Upload a Job Description (PDF or DOCX)", type=["pdf", "docx"])
+# st.markdown('</div>', unsafe_allow_html=True)
 
-        /* Input Fields */
-        .stTextInput > div > input,
-        .stTextArea > div > textarea,
-        .stFileUploader {
-            border-radius: 8px;
-            background-color: #F3E5F5 !important; /* Light purple background */
-            border: 1px solid #AB47BC !important; /* Purple border */
-            color: #4A148C !important; /* Dark purple text */
-            transition: border-color 0.3s ease, box-shadow 0.3s ease;
-        }
-        .stTextInput > div > input:focus,
-        .stTextArea > div > textarea:focus {
-            border-color: #7B1FA2 !important; /* Darker purple on focus */
-            box-shadow: 0 0 5px rgba(123, 31, 162, 0.3);
-        }
-        .stFileUploader label {
-            color: #6B7280;
-        }
+# # --- Scam Keywords Check ---
+# scam_keywords = [
+#     "quick money", "work from home", "no experience needed", "click here", "earn cash",
+#     "urgent requirement", "100% free", "send money", "training fee", "instant hiring",
+#     "no interview", "payment before joining", "guaranteed income", "easy income",
+#     "limited seats", "signup bonus", "sms job", "whatsapp job", "daily payout", "money transfer"
+# ]
 
-        /* Button Styling with Pulse Animation */
-        .stButton > button {
-            background-color: #FF6F61 !important; /* Coral button */
-            color: white !important;
-            border-radius: 8px;
-            padding: 12px 24px;
-            font-size: 16px;
-            font-weight: 600;
-            border: none;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-        .stButton > button:hover {
-            background-color: #FF3D00 !important; /* Darker coral on hover */
-            animation: pulse 0.5s;
-            box-shadow: 0 6px 10px rgba(0, 0, 0, 0.15);
-        }
+# def contains_scam_keywords(text):
+#     text = text.lower()
+#     return any(keyword in text for keyword in scam_keywords)
 
-        /* Centered Loading Box with Wave Animation */
-        .loading-box {
-            width: 100%;
-            height: 100vh;
-            position: fixed;
-            top: 0;
-            left: 0;
-            background: rgba(40, 53, 147, 0.9); /* Indigo overlay with gradient */
-            animation: loadingGradient 6s infinite;
-            color: #FFFFFF;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            font-size: 24px;
-            font-weight: 600;
-            z-index: 9999;
-            flex-direction: column;
-        }
-        .wave-container {
-            display: flex;
-            gap: 5px;
-            margin-bottom: 15px;
-        }
-        .wave-bar {
-            width: 10px;
-            height: 30px;
-            background-color: #FF6F61; /* Starting color */
-            border-radius: 5px;
-            animation: waveBar 2s infinite;
-        }
-        .wave-bar:nth-child(2) {
-            animation-delay: 0.2s;
-        }
-        .wave-bar:nth-child(3) {
-            animation-delay: 0.4s;
-        }
-        .wave-bar:nth-child(4) {
-            animation-delay: 0.6s;
-        }
-        .wave-bar:nth-child(5) {
-            animation-delay: 0.8s;
-        }
-        .ball {
-            width: 10px;
-            height: 10px;
-            background-color: #FFCA28; /* Yellow balls */
-            border-radius: 50%;
-            margin: 5px;
-            animation: bounce 1.5s infinite;
-            position: absolute;
-        }
-        .ball:nth-child(2) {
-            animation-delay: 0.5s;
-        }
-        .ball:nth-child(3) {
-            animation-delay: 1s;
-        }
-        .fade-text {
-            animation: fadeText 2s infinite;
-        }
+# # --- Preprocess Function ---
+# def preprocess_text(text):
+#     text = unicodedata.normalize('NFKD', text)
+#     text = text.lower()
+#     text = re.sub(r'http\S+', '', text)
+#     text = re.sub(r'<.*?>', '', text)
+#     text = text.translate(str.maketrans('', '', string.punctuation))
+#     text = re.sub(r'\d+', '', text)
+#     text = ' '.join(text.split())
+#     return text
 
-        /* Highlight uploaded file */
-        .highlight-file {
-            background-color: #FFECB3; /* Light yellow */
-            padding: 10px 15px;
-            border-radius: 8px;
-            font-weight: 600;
-            color: #E65100; /* Orange text */
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
-        }
+# # --- File Text Extraction ---
+# def extract_text_from_file(uploaded_file):
+#     if uploaded_file is not None:
+#         extension = os.path.splitext(uploaded_file.name)[1].lower()
+#         if extension == ".pdf":
+#             doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+#             return " ".join([page.get_text() for page in doc])
+#         elif extension == ".docx":
+#             doc = docx.Document(uploaded_file)
+#             return " ".join([para.text for para in doc.paragraphs])
+#     return ""
 
-        /* Result Animation (Slide Up) */
-        .result-container {
-            animation: slideUp 0.5s ease-out;
-        }
+# # --- Create SQLite Table If Not Exists ---
+# def create_db():
+#     with sqlite3.connect(DB_PATH) as conn:
+#         conn.execute('''CREATE TABLE IF NOT EXISTS postings (
+#                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                             job_title TEXT,
+#                             description TEXT,
+#                             prediction INTEGER
+#                         )''')
 
-        /* Success and Error Messages */
-        .stSuccess, .stError {
-            border-radius: 8px;
-            padding: 15px;
-            margin-top: 20px;
-            font-weight: 500;
-        }
-        .stSuccess {
-            background-color: #C8E6C9; /* Light green */
-            border: 1px solid #4CAF50; /* Green border */
-            color: #1B5E20; /* Dark green text */
-        }
-        .stError {
-            background-color: #FFCDD2; /* Light red */
-            border: 1px solid #EF5350; /* Red border */
-            color: #B71C1C; /* Dark red text */
-        }
+# create_db()
 
-        /* Column spacing */
-        .stColumns > div {
-            padding: 10px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-    </style>
-""", unsafe_allow_html=True)
+# # --- Analysis Button ---
+# if st.button("Analyze Now"):
+#     extracted_text = extract_text_from_file(uploaded_file) if uploaded_file else ""
+#     final_description = extracted_text if extracted_text else job_description.strip()
 
-# Main application logic
-with st.container():
-    # Title
-    st.title("🔍 Job Authenticity Checker")
+#     if final_description:
+#         processed_text = preprocess_text(final_description)
 
-    # Two-column layout for better organization
-    col1, col2 = st.columns([1, 1], gap="medium")
+#         # If scam keywords detected
+#         if contains_scam_keywords(processed_text):
+#             prediction = 1  # Force fake
+#             st.warning("⚠️ This job contains suspicious phrases and is classified as **FAKE**.")
+#         else:
+#             # Loading animation
+#             loading_placeholder = st.empty()
+#             loading_placeholder.markdown(
+#                 '<div class="loading-box"><div class="wave-container"><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div></div><span class="fade-text">Processing Your Job Check! 🎉 Stay Tuned... 🚀</span><div class="ball"></div><div class="ball"></div><div class="ball"></div></div>',
+#                 unsafe_allow_html=True
+#             )
 
-    # File upload section
-    with col1:
-        with st.container():
-            st.markdown('<div class="card card-left">', unsafe_allow_html=True)
-            st.markdown("### Upload Job Description", unsafe_allow_html=True)
-            uploaded_file = st.file_uploader("Supports PDF/DOCX files", type=["pdf", "docx"])
-            if uploaded_file:
-                st.markdown(f'<div class="highlight-file">📄 {uploaded_file.name}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+#             start_time = time.time()
+#             vectorized_text = tfidf_vectorizer.transform([processed_text])
+#             prediction = model.predict(vectorized_text)[0]
+#             elapsed_time = time.time() - start_time
+#             time.sleep(max(0, 8 - elapsed_time))
 
-    # Manual input section
-    with col2:
-        with st.container():
-            st.markdown('<div class="card card-right">', unsafe_allow_html=True)
-            st.markdown("### Or Enter Manually", unsafe_allow_html=True)
-            job_title = st.text_input("Job Title (Optional)", placeholder="Enter job title...")
-            job_description = st.text_area("Job Description", placeholder="Paste job description here...", height=150)
-            st.markdown('</div>', unsafe_allow_html=True)
+#             loading_placeholder.empty()
 
-    # Center the button below columns
-    st.markdown("<div style='display: flex; justify-content: center; margin-top: 20px;'>", unsafe_allow_html=True)
-    if st.button("Analyze Now"):
-        if not uploaded_file and not job_description.strip():
-            st.error("⚠️ Please upload a file or enter a job description before submitting.")
-        else:
-            # Display loading message with wave animation
-            loading_placeholder = st.empty()
-            loading_placeholder.markdown(
-                '<div class="loading-box"><div class="wave-container"><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div></div><span class="fade-text">Processing Your Job Check! 🎉 Stay Tuned... 🚀</span><div class="ball"></div><div class="ball"></div><div class="ball"></div></div>',
-                unsafe_allow_html=True
-            )
+#         # Save result to DB
+#         with sqlite3.connect(DB_PATH) as conn:
+#             conn.execute("INSERT INTO postings (job_title, description, prediction) VALUES (?, ?, ?)",
+#                          (job_title, final_description, int(prediction)))
+#             conn.commit()
 
-            # Simulate processing time (8-10 seconds)
-            time.sleep(random.randint(8, 10))
+#         # Display result
+#         st.markdown('<div class="result-container">', unsafe_allow_html=True)
+#         if prediction == 0:
+#             st.success("✅ The job posting seems legitimate!")
+#             st.markdown("**Next Steps:** Proceed with confidence, but always double-check details.")
+#         else:
+#             st.error("❌ This job posting may be fake! 🚨")
+#             st.markdown("**Recommendation:** Verify the source and contact the employer directly.")
+#         st.markdown('</div>', unsafe_allow_html=True)
 
-            # Remove loading message
-            loading_placeholder.empty()
+#         if uploaded_file:
+#             st.markdown(f'<div class="highlight-file">📄 {uploaded_file.name}</div>', unsafe_allow_html=True)
+#     else:
+#         st.warning("⚠️ Please upload a file or enter a job description.")
 
-            # Dummy Result
-            result = random.choice([True, False])
 
-            # Display Result with animation
-            result_placeholder = st.empty()
-            with result_placeholder.container():
-                st.markdown('<div class="result-container">', unsafe_allow_html=True)
-                if result:
-                    st.success("✅ The job posting seems legitimate!")
-                    st.markdown("**Next Steps:** Proceed with confidence, but always double-check details.")
-                else:
-                    st.error("⚠️ This job posting may be fake! 🚨")
-                    st.markdown("**Recommendation:** Verify the source and contact the employer directly.")
-                st.markdown('</div>', unsafe_allow_html=True)
 
-            # Highlight the uploaded file name again (if present)
-            if uploaded_file:
-                st.markdown(f'<div class="highlight-file">📄 {uploaded_file.name}</div>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
