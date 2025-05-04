@@ -419,12 +419,12 @@ def main():
                     # Check for scam keywords first
                     if contains_scam_keywords(description):
                         prediction = 1
-                        result_text = "This job posting is likely fraudulent."
+                        result_text = "This job posting is likely fake."
                         color = "#FF5733"
                         debug_message = "DEBUG: Prediction based on scam keywords detected."
                     else:
                         prediction = predict_job_real_or_fake(description)
-                        result_text = "This job posting appears to be authentic." if prediction == 0 else "This job posting is likely fraudulent."
+                        result_text = "This job posting appears to be authentic." if prediction == 0 else "This job posting is likely fake."
                         color = "#4CAF50" if prediction == 0 else "#FF5733"
                         debug_message = "DEBUG: Prediction based on pickle model."
 
@@ -474,7 +474,7 @@ def main():
 
     elif choice == "About":
         st.subheader("About This App")
-        st.info("This application assists in detecting fraudulent job postings using a combination of machine learning predictions and keyword-based analysis.")
+        st.info("This application assists in detecting fake job postings using a combination of machine learning predictions and keyword-based analysis.")
 
 if __name__ == "__main__":
     initialize_db()
