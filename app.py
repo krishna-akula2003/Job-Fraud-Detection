@@ -450,7 +450,7 @@ def main():
                 stack_trace = [
                     "Input received and preprocessed.",
                     "Text transformed using TF-IDF Vectorizer.",
-                    "Transformed input passed to Logistic Regression model.",
+                    "Transformed input passed to ensemble model.",
                     f"Model prediction: {st.session_state.prediction} → Classified as {'REAL' if st.session_state.prediction == 0 else 'FAKE'} job."
                 ]
                 explanation_html = "<div class='prediction-box' style='background-color:#ffffff; color:#333333; font-size:18px; margin-top:10px;'>"
