@@ -172,7 +172,7 @@ import webbrowser
 st.set_page_config(page_title="Job Authenticity Checker", layout="wide")
 
 # Paths
-BASE_DIR = r"C:\xampp_inuse\htdocs\web\formvalidation\prediction"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "logistic_newdataset (2).pkl")
 VECTORIZER_PATH = os.path.join(BASE_DIR, "tfidf_vectorizer_newdataset.pkl")
 DB_PATH = os.path.join(BASE_DIR, "job_postings.db")
